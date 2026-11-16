@@ -1,0 +1,374 @@
+import json
+import os
+import platform
+import time
+
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import sklearn
+from sklearn.metrics import accuracy_score, confusion_matrix
+
+import common as C
+
+OUT = f"{C.RESULTS}/exp4"
+MAIN = ["LogReg", "kNN", "MLP"]
+CONDITIONS = [
+    ("clean", 0, "Clean"),
+    ("train_size", C.FOCUS["train_size"], f"{C.FOCUS['train_size']} training images"),
+    ("noise", C.FOCUS["noise"], f"Noise std {C.FOCUS['noise']}"),
+    ("mask", C.FOCUS["mask"], f"{C.FOCUS['mask']}x{C.FOCUS['mask']} px mask"),
+]
+
+def run_all(data, best):
+    X_tr, y_tr, X_te, y_te = data["X_train"], data["y_train"], data["X_test"], data["y_test"]
+    runs, preds, inputs = [], {}, {"clean": X_te}
+
+    def record(cond, level, model, seed, pred):
+        row = {"condition": cond, "level": level, "model": model, "seed": seed,
+               "accuracy": accuracy_score(y_te, pred)}
+        row.update(dict(zip(C.CLASSES, C.per_class_recall(y_te, pred))))
+        runs.append(row)
+        is_focus = cond == "clean" or level == C.FOCUS[cond]
+        if seed == 0 and is_focus:
+            preds.setdefault(cond, {})[model] = pred
+
+    ref = C.train_reference_models(data, best)
+    for name in C.MODELS:
+        for s in ([0] if name in C.DETERMINISTIC else C.SEEDS):
+            record("clean", 0, name, s, ref[name][s].predict(X_te))
+    clean_rows = list(runs)
+    C.log("clean done")
+
+    for size in C.TRAIN_SIZES:
+        if size >= len(X_tr):
+            continue
+        for s in C.SEEDS:
+            Xs, ys = C.subsample(X_tr, y_tr, size, s)
+            for name in C.MODELS:
+                m = C.make_model(name, best[name], s).fit(Xs, ys)
+                record("train_size", size, name, s, m.predict(X_te))
+        C.log(f"train size {size} done")
+
+    for cond, levels in [("noise", C.NOISE_LEVELS), ("mask", C.MASK_SIZES)]:
+        corrupt = C.CORRUPT[cond]
+        for level in levels:
+            for s in C.SEEDS:
+                Xc = corrupt(X_te, level, s)
+                if s == 0 and level == C.FOCUS[cond]:
+                    inputs[cond] = Xc
+                if C.SETTING[cond] == "test_only":
+                    models = {n: ref[n][s] for n in C.MODELS}
+                else:  # train_and_test: corrupt training images too and retrain
+                    Xtc = corrupt(X_tr, level, s + 100)
+                    models = {n: C.make_model(n, best[n], s).fit(Xtc, y_tr) for n in C.MODELS}
+                for name in C.MODELS:
+                    record(cond, level, name, s, models[name].predict(Xc))
+            C.log(f"{cond} {level} done ({C.SETTING[cond]})")
+
+    for cond, start_level in [("train_size", len(X_tr)), ("noise", 0), ("mask", 0)]:
+        runs += [{**r, "condition": cond, "level": start_level} for r in clean_rows]
+
+    return pd.DataFrame(runs), preds, inputs
+
+def stats(runs, cond, level):
+    sub = runs[(runs.condition == cond) & (runs.level == level)][["model", "accuracy"] + C.CLASSES]
+    g = sub.groupby("model")
+    mean = g.mean().loc[C.MODELS].T
+    std = g.std().fillna(0.0).loc[C.MODELS].T     # one deterministic run gets std 0
+    return mean, std
+
+def save_tables(runs):
+    means, tables, drops = {}, [], {}
+    for cond, level, label in CONDITIONS:
+        m, s = stats(runs, cond, level)
+        means[cond] = m
+        t = pd.DataFrame({n: m[n].round(3).astype(str) + " ± " + s[n].round(3).astype(str)
+                          for n in C.MODELS})
+        t.index.name = "class"
+        t.to_csv(f"{OUT}/per_class_recall_{cond}.csv")
+        tables.append(t.add_prefix(f"{label} | "))
+        if cond != "clean":
+            drops[label] = (means["clean"] - m).loc[C.CLASSES, MAIN]
+    pd.concat(tables, axis=1).to_csv(f"{OUT}/per_class_recall_all_conditions.csv")
+    pd.concat(drops, axis=1).round(3).to_csv(f"{OUT}/per_class_drop_from_clean.csv")
+    return means, drops
+
+
+def plot_drop_heatmap(drops):
+    vmax = max(0.05, max(float(np.nanmax(d.values)) for d in drops.values()))
+    fig, axes = plt.subplots(1, len(drops), figsize=(5 * len(drops), 4.8))
+    for ax, (label, d) in zip(axes, drops.items()):
+        im = ax.imshow(d.clip(lower=0).values, cmap="Blues", vmin=0, vmax=vmax)
+        ax.set_xticks(range(len(MAIN)), MAIN, fontsize=8)
+        ax.set_yticks(range(10), C.CLASSES)
+        ax.set_title(label, fontsize=10)
+        for i in range(10):
+            for j in range(len(MAIN)):
+                v = d.values[i, j]
+                ax.text(j, i, f"{v:.2f}", ha="center", va="center", fontsize=8,
+                        color="white" if v > 0.6 * vmax else "#222222")
+    fig.colorbar(im, ax=axes, shrink=0.8, label="Recall lost vs clean")
+    fig.suptitle("Which classes break first, per model (mean over 3 seeds)")
+    fig.savefig(f"{OUT}/per_class_drop_heatmap.png", dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_confusions(preds, y):
+    counts = np.bincount(y, minlength=10)
+    rows = []
+    for cond, _, label in CONDITIONS:
+        fig, axes = plt.subplots(1, 3, figsize=(17, 5.2))
+        for ax, name in zip(axes, MAIN):
+            cm = confusion_matrix(y, preds[cond][name], labels=range(10))
+            cmn = cm / counts[:, None]
+            ax.imshow(cmn, cmap="Blues", vmin=0, vmax=1)
+            for i in range(10):
+                for j in range(10):
+                    if cmn[i, j] >= 0.01:
+                        ax.text(j, i, f"{cmn[i, j]:.2f}", ha="center", va="center",
+                                fontsize=6.5, color="white" if cmn[i, j] > 0.6 else "#222222")
+            ax.set_xticks(range(10), C.CLASSES, rotation=45, ha="right", fontsize=8)
+            ax.set_yticks(range(10), C.CLASSES, fontsize=8)
+            ax.set_xlabel("Predicted")
+            ax.set_ylabel("True")
+            ax.set_title(name)
+            off = cm.copy()
+            np.fill_diagonal(off, 0)
+            for flat in np.argsort(off.ravel())[::-1][:3]:
+                i, j = divmod(int(flat), 10)
+                rows.append({"condition": label, "model": name, "true": C.CLASSES[i],
+                             "predicted_as": C.CLASSES[j],
+                             "share_of_true_class": round(cm[i, j] / counts[i], 3)})
+        fig.suptitle(f"Confusion matrices, normalized by true class (seed 0): {label}")
+        fig.tight_layout()
+        fig.savefig(f"{OUT}/confusion_{cond}.png", dpi=150)
+        plt.close(fig)
+    pairs = pd.DataFrame(rows)
+    pairs.to_csv(f"{OUT}/top_confused_pairs.csv", index=False)
+    return pairs
+
+def save_agreement(preds, y):
+    frames = []
+    for cond, _, label in CONDITIONS:
+        correct = pd.DataFrame({n: preds[cond][n] == y for n in MAIN})
+        a = correct.value_counts().rename("images").reset_index()
+        a.insert(0, "condition", label)
+        a["share"] = (a.images / len(y)).round(4)
+        frames.append(a)
+    pd.concat(frames).to_csv(f"{OUT}/agreement.csv", index=False)
+
+
+def plot_examples(preds, inputs, y, accs):
+    def show(cond, idx, title, fname):
+        idx = list(idx)[:8]
+        if not idx:
+            return
+        fig, axes = plt.subplots(1, len(idx), figsize=(1.9 * len(idx), 2.9))
+        for ax, i in zip(np.atleast_1d(axes), idx):
+            ax.imshow(inputs[cond][i].reshape(28, 28), cmap="gray", vmin=0, vmax=1)
+            p = preds[cond]
+            ax.set_title(f"true {C.CLASSES[y[i]]}\nLR {C.CLASSES[p['LogReg'][i]]}"
+                         f"\nkNN {C.CLASSES[p['kNN'][i]]}\nMLP {C.CLASSES[p['MLP'][i]]}",
+                         fontsize=7)
+            ax.axis("off")
+        fig.suptitle(title)
+        fig.tight_layout()
+        fig.savefig(f"{OUT}/{fname}", dpi=150)
+        plt.close(fig)
+
+    ok = {cond: {n: preds[cond][n] == y for n in MAIN} for cond in preds}
+    c = ok["clean"]
+    show("clean", np.where(c["MLP"] & ~c["LogReg"])[0], "Clean: MLP right, LR wrong",
+         "examples_clean_mlp_right_lr_wrong.png")
+    show("clean", np.where(c["LogReg"] & ~c["kNN"])[0], "Clean: LR right, kNN wrong",
+         "examples_clean_lr_right_knn_wrong.png")
+    show("clean", np.where(~(c["LogReg"] | c["kNN"] | c["MLP"]))[0],
+         "Clean: all three wrong", "examples_clean_all_wrong.png")
+
+    # Under each stress test: images the most robust model gets right and the least robust gets wrong
+    for cond in ["noise", "mask"]:
+        drop = (accs["clean"] - accs[cond])[MAIN]
+        best, worst = drop.idxmin(), drop.idxmax()
+        idx = np.where(ok[cond][best] & ~ok[cond][worst] & ok["clean"][worst])[0]
+        show(cond, idx, f"{cond}: {best} right, {worst} wrong (but {worst} right on clean)",
+             f"examples_{cond}_{best}_right_{worst}_wrong.png")
+
+SWEEPS = [("train_size", "Training images"),
+          ("noise", "Noise std on test pixels"),
+          ("mask", "Side of black square (px)")]
+
+
+def level_means(runs):
+    sweep = runs[runs.condition != "clean"]
+    return sweep.groupby(["condition", "level", "model"])[["accuracy"] + C.CLASSES].mean()
+
+
+def save_accuracy_by_level(runs):
+    g = runs[runs.condition != "clean"].groupby(["condition", "level", "model"])["accuracy"]
+    acc = g.agg(["mean", "std"]).fillna(0.0).round(4).reset_index()
+    acc.to_csv(f"{OUT}/accuracy_by_level.csv", index=False)
+
+    fig, axes = plt.subplots(1, 3, figsize=(16, 4.6))
+    for ax, (cond, xlabel) in zip(axes, SWEEPS):
+        sub = acc[acc.condition == cond]
+        for name in C.MODELS:
+            d = sub[sub.model == name].sort_values("level")
+            ax.errorbar(d.level, d["mean"], yerr=d["std"], label=name, color=C.COLORS[name],
+                        linewidth=2, marker="o", markersize=6, capsize=3)
+        if cond == "train_size":
+            ax.set_xscale("log")
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel("Test accuracy")
+        ax.grid(alpha=0.25)
+        ax.spines[["top", "right"]].set_visible(False)
+    axes[0].legend(frameon=False)
+    fig.suptitle("Overall accuracy at every level (mean ± std over 3 seeds)")
+    fig.tight_layout()
+    fig.savefig(f"{OUT}/accuracy_by_level.png", dpi=150)
+    plt.close(fig)
+
+
+def plot_class_by_level(means):
+    table = means[C.CLASSES].round(4).reset_index()
+    table.to_csv(f"{OUT}/per_class_by_level.csv", index=False)
+
+    fig, axes = plt.subplots(3, 3, figsize=(15, 14))
+    for r, (cond, xlabel) in enumerate(SWEEPS):
+        for c, name in enumerate(MAIN):
+            ax = axes[r, c]
+            d = means.loc[cond].xs(name, level="model")[C.CLASSES]
+            # Left to right always means worse: more noise or mask, or less data
+            d = d.sort_index(ascending=(cond != "train_size"))
+            vals = d.T.values
+            ax.imshow(vals, cmap="Blues", vmin=0, vmax=1, aspect="auto")
+            labels = [f"{int(l)}" if cond != "noise" else f"{l:g}" for l in d.index]
+            ax.set_xticks(range(len(labels)), labels, fontsize=8,
+                          rotation=45 if cond == "train_size" else 0)
+            ax.set_yticks(range(10), C.CLASSES if c == 0 else [], fontsize=8)
+            for i in range(vals.shape[0]):
+                for j in range(vals.shape[1]):
+                    ax.text(j, i, f"{vals[i, j]:.2f}", ha="center", va="center", fontsize=7,
+                            color="white" if vals[i, j] > 0.6 else "#222222")
+            if r == 0:
+                ax.set_title(name, fontsize=12)
+            ax.set_xlabel(xlabel + ("  (worse to the right)" if c == 1 else ""), fontsize=9)
+    fig.suptitle("Recall of each class as conditions get worse (mean over 3 seeds)", fontsize=13)
+    fig.tight_layout()
+    fig.savefig(f"{OUT}/class_recall_by_level.png", dpi=150)
+    plt.close(fig)
+
+
+def severity_summary(means):
+    L = ["5. Across all levels (worst level vs clean)"]
+    for cond, xlabel in SWEEPS:
+        m = means.loc[cond]
+        levels = sorted(m.index.get_level_values("level").unique())
+        clean_level = levels[-1] if cond == "train_size" else levels[0]
+        worst = levels[0] if cond == "train_size" else levels[-1]
+        L.append(f"   {xlabel}: clean = {clean_level:g}, worst = {worst:g}")
+        for name in MAIN:
+            d = m.xs(name, level="model")[C.CLASSES]
+            drop = (d.loc[clean_level] - d.loc[worst]).sort_values(ascending=False)
+            order = levels[::-1] if cond == "train_size" else levels
+            ok_at_clean = d.columns[d.loc[clean_level] >= 0.5]   # ignore classes already weak
+            first = None
+            for lv in order:
+                below = d.loc[lv, ok_at_clean][d.loc[lv, ok_at_clean] < 0.5]
+                if len(below):
+                    first = (lv, below.idxmin())
+                    break
+            msg = (f"first class to fall below 0.5 recall: {first[1]} at {first[0]:g}"
+                   if first else "no class falls below 0.5 recall")
+            L.append(f"     {name}: biggest losses {drop.index[0]} ({drop.iloc[0]:.2f}), "
+                     f"{drop.index[1]} ({drop.iloc[1]:.2f}); {msg}")
+    return L
+
+
+def write_summary(means, drops, pairs, by_level):
+    acc = {cond: means[cond].loc["accuracy"] for cond, _, _ in CONDITIONS}
+    clean = means["clean"]
+    rank0 = list(acc["clean"][MAIN].sort_values(ascending=False).index)
+    L = ["EXPERIMENT 4: CLASS LEVEL SUMMARY", "=" * 33, ""]
+
+    L.append("1. Clean reference (full data, clean images)")
+    for n in C.MODELS:
+        L.append(f"   {n:8s} accuracy {acc['clean'][n]:.3f}")
+    L.append(f"   Ranking: {' > '.join(rank0)}")
+    avg = clean.loc[C.CLASSES, MAIN].mean(axis=1).sort_values()
+    L.append(f"   Hardest classes for all models: {', '.join(avg.index[:3])}")
+    L.append(f"   Easiest classes for all models: {', '.join(avg.index[::-1][:3])}")
+    for n in MAIN:
+        weak = clean[n].loc[C.CLASSES].sort_values().index[:2]
+        top = pairs[(pairs.condition == "Clean") & (pairs.model == n)].iloc[0]
+        L.append(f"   {n}: weakest classes {', '.join(weak)}; most common error "
+                 f"{top.true} predicted as {top.predicted_as} "
+                 f"({top.share_of_true_class:.0%} of {top.true})")
+    L.append("")
+
+    for k, (cond, _, label) in enumerate(CONDITIONS[1:], start=2):
+        setting = C.SETTING.get(cond, "training data only")
+        L.append(f"{k}. {label}  [{setting}]")
+        a = acc[cond]
+        for n in MAIN:
+            L.append(f"   {n:8s} accuracy {a[n]:.3f} (drop {acc['clean'][n] - a[n]:.3f})")
+        rank = list(a[MAIN].sort_values(ascending=False).index)
+        L.append(f"   Ranking: {' > '.join(rank)} "
+                 f"(ranking {'changed' if rank != rank0 else 'did not change'} vs clean)")
+        L.append(f"   Smallest accuracy drop: {(acc['clean'][MAIN] - a[MAIN]).idxmin()}")
+        for n in MAIN:
+            top2 = drops[label][n].sort_values(ascending=False).index[:2]
+            L.append(f"   {n}: classes that lost most recall: "
+                     f"{', '.join(f'{c} ({drops[label][n][c]:.2f})' for c in top2)}")
+        top = pairs[pairs.condition == label].sort_values("share_of_true_class").iloc[::-1].iloc[0]
+        L.append(f"   Biggest single confusion: {top.model} labels "
+                 f"{top.share_of_true_class:.0%} of {top.true} as {top.predicted_as}")
+        L.append("")
+
+    L += severity_summary(by_level)
+    text = "\n".join(L)
+    with open(f"{OUT}/summary.txt", "w") as f:
+        f.write(text)
+    print("\n" + text)
+    return acc
+
+
+def main():
+    t0 = time.time()
+    os.makedirs(OUT, exist_ok=True)
+    data = C.get_data()
+    best = C.get_best_params(data)
+    runs, preds, inputs = run_all(data, best)
+    runs.to_csv(f"{OUT}/all_runs.csv", index=False)
+
+    y = data["y_test"]
+    means, drops = save_tables(runs)
+    plot_drop_heatmap(drops)
+    pairs = plot_confusions(preds, y)
+    save_agreement(preds, y)
+    by_level = level_means(runs)
+    save_accuracy_by_level(runs)
+    plot_class_by_level(by_level)
+    acc = write_summary(means, drops, pairs, by_level)
+    plot_examples(preds, inputs, y, acc)
+
+    settings = {
+        "python": platform.python_version(), "numpy": np.__version__,
+        "pandas": pd.__version__, "scikit_learn": sklearn.__version__,
+        "matplotlib": matplotlib.__version__, "quick_mode": C.QUICK, "seeds": C.SEEDS,
+        "train_size_full": len(data["X_train"]), "focus_levels": C.FOCUS,
+        "train_sizes": C.TRAIN_SIZES, "noise_levels": C.NOISE_LEVELS, "mask_sizes": C.MASK_SIZES,
+        "noise_setting": C.NOISE_SETTING, "mask_setting": C.MASK_SETTING,
+        "best_params": {k: str(v) for k, v in best.items()},
+        "runtime_minutes": round((time.time() - t0) / 60, 1),
+    }
+    with open(f"{OUT}/settings.json", "w") as f:
+        json.dump(settings, f, indent=2)
+    C.log(f"done in {settings['runtime_minutes']} min, see {OUT}")
+
+
+if __name__ == "__main__":
+    main()
