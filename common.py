@@ -1,14 +1,3 @@
-"""
-Shared setup for Team 3 (CSCI B 555, Fall 2026): Fashion MNIST robustness.
-
-Every experiment file imports this module, so all four parts use the same
-data split, scaling, models, tuned hyperparameters, seeds and corruptions.
-
-    from common import *
-
-Settings marked TEAM DECISION should be agreed on before reporting results.
-"""
-
 import json
 import os
 import time
@@ -24,8 +13,6 @@ from sklearn.neural_network import MLPClassifier
 
 warnings.filterwarnings("ignore", category=ConvergenceWarning)
 warnings.filterwarnings("ignore", message=".*zero standard deviation.*")
-
-# General settings
 
 QUICK = os.environ.get("QUICK") == "1"   # QUICK=1 runs a small smoke test
 RESULTS = "results"
@@ -49,19 +36,10 @@ SEARCH = {
             {"hidden_layer_sizes": (256, 128)}],
 }
 
-# Stress test levels (TEAM DECISION)
-# Pixels are scaled to 0..1, so noise 0.39 here equals noise 100 on the 0..255 scale.
 TRAIN_SIZES = [500, 1000, 2000, 5000, 10000, 20000]   # full training set is added on top
 NOISE_LEVELS = [0.1, 0.2, 0.3, 0.5]                   # std of Gaussian pixel noise
 MASK_SIZES = [4, 8, 12, 16]                           # side of a black square, in pixels
 
-# Where each corruption is applied (TEAM DECISION)
-#   "test_only":      train on clean images, test on corrupted ones (deployment robustness)
-#   "train_and_test": corrupt both, retrain, then test (learning from damaged data)
-NOISE_SETTING = "test_only"
-MASK_SETTING = "test_only"
-
-# One representative level per stress test, used for class level tables (TEAM DECISION)
 FOCUS = {"train_size": 1000, "noise": 0.2, "mask": 12}
 
 if QUICK:
@@ -75,9 +53,7 @@ def log(msg):
 
 
 # Data
-
 def _download_raw():
-    """Official files from the Fashion MNIST authors (Xiao et al., 2017)."""
     import gzip
     import urllib.request
     base = "https://raw.githubusercontent.com/zalandoresearch/fashion-mnist/master/data/fashion/"
@@ -94,7 +70,6 @@ def _download_raw():
 
 
 def load_raw():
-    """Fashion MNIST as uint8 arrays (official 60000 train, 10000 test), cached locally."""
     cache = "fashion_mnist.npz"
     if not os.path.exists(cache):
         try:
@@ -111,10 +86,6 @@ def load_raw():
 
 
 def get_data():
-    """Scaled data with one fixed split. The test set is never used for tuning.
-
-    Returns a dict with X_train, y_train (50000), X_val, y_val (10000), X_test, y_test (10000).
-    """
     X_full, y_full, X_test, y_test = load_raw()
     X_full = (X_full / 255.0).astype(np.float32)
     X_test = (X_test / 255.0).astype(np.float32)
@@ -135,29 +106,22 @@ def get_data():
 
 
 def subsample(X, y, size, seed):
-    """Stratified random subset of the training data (same subset for a given seed)."""
     if size >= len(X):
         return X, y
     Xs, _, ys, _ = train_test_split(X, y, train_size=size, stratify=y, random_state=seed)
     return Xs, ys
 
-
-# Corruptions
-
 def _rng(kind, level, seed):
-    """Same seed and level always give the same corrupted images, for every teammate."""
     return np.random.default_rng([seed, int(round(level * 1000)), {"noise": 1, "mask": 2}[kind]])
 
 
 def add_noise(X, sigma, seed):
-    """Gaussian pixel noise on 0..1 images, clipped back to 0..1. Works on any array."""
     rng = _rng("noise", sigma, seed)
     noisy = X + rng.normal(0.0, sigma, X.shape).astype(np.float32)
     return np.clip(noisy, 0.0, 1.0)
 
 
 def add_mask(X, size, seed):
-    """Black out one random size x size square in every image."""
     rng = _rng("mask", size, seed)
     imgs = X.reshape(len(X), 28, 28).copy()
     rows = rng.integers(0, 28 - size + 1, len(X))
@@ -172,7 +136,6 @@ SETTING = {"noise": NOISE_SETTING, "mask": MASK_SETTING}
 
 
 # Models
-
 def make_model(name, params, seed):
     if name == "Baseline":
         return NearestCentroid()
@@ -187,11 +150,6 @@ def make_model(name, params, seed):
 
 
 def get_best_params(data):
-    """Tune once on clean validation data and save to results/best_params.json.
-
-    Later runs (by any teammate) load the saved file, so everyone uses the same
-    hyperparameters. Delete the file to tune again.
-    """
     os.makedirs(RESULTS, exist_ok=True)
     path = f"{RESULTS}/best_params{'_quick' if QUICK else ''}.json"
     if os.path.exists(path):
@@ -217,12 +175,6 @@ def get_best_params(data):
 
 
 def train_reference_models(data, best_params, X=None, y=None):
-    """Models with tuned settings, one per seed (deterministic models are shared).
-
-    By default trains on the full clean training set. Pass X, y to train on
-    something else (a subset, or corrupted training images).
-    Returns {model name: {seed: fitted model}}.
-    """
     X = data["X_train"] if X is None else X
     y = data["y_train"] if y is None else y
     models = {}
@@ -236,8 +188,6 @@ def train_reference_models(data, best_params, X=None, y=None):
 
 
 # Metrics
-
 def per_class_recall(y, pred):
-    """Share of each class's test images that the model labels correctly."""
     cm = confusion_matrix(y, pred, labels=range(10))
     return cm.diagonal() / cm.sum(axis=1)
