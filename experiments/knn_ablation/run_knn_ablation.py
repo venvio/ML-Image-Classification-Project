@@ -1,7 +1,7 @@
 """kNN ablation for Fashion-MNIST: clean training, clean/noisy test inputs.
 
 Downloads the official Fashion-MNIST IDX gzip files into ./data/fashion_mnist,
-then writes metrics, settings, and a plot into ./results. No TensorFlow needed.
+then writes metrics, settings, and a plot into ./results.
 """
 
 import gzip
